@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# flashberry – flash an (optionally compressed) disk image to a block device
+
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+    echo "Usage: $0 <image_file> <target-block-device>" >&2
+    exit 1
+fi
+
+IMAGE_FILE=$1
+TARGET_DEV=$2
+
+# --- Sanity checks ------------------------------------------------------------
+[[ -f $IMAGE_FILE ]] || { echo "Error: '$IMAGE_FILE' not found." >&2; exit 1; }
+[[ -e $TARGET_DEV   ]] || { echo "Error: '$TARGET_DEV' does not exist." >&2; exit 1; }
+
+# Confirm if not a block device
+if [[ ! -b $TARGET_DEV ]]; then
+    read -r -p "Warning: $TARGET_DEV is NOT a block device. Type Y to continue: " c
+    [[ $c =~ ^[Yy]$ ]] || exit 1
+fi
+
+# Refuse if any partition on target is mounted
+if lsblk -no MOUNTPOINTS "$TARGET_DEV" | grep -q '.'; then
+    echo "Error: $TARGET_DEV (or its partitions) is mounted." >&2
+    exit 1
+fi
+
+# Guard against system disk overwrite: compare to root device parents
+root_src=$(findmnt -no SOURCE /)              # e.g. /dev/nvme0n1p2
+root_base=$(lsblk -no PKNAME "$root_src" 2>/dev/null || true)
+root_base=${root_base:-$(basename "$root_src")}     # fallback
+target_base=$(basename "$TARGET_DEV")
+# If user passed a partition, get its parent disk
+target_pk=$(lsblk -no PKNAME "$TARGET_DEV" 2>/dev/null || true)
+target_disk=${target_pk:-$target_base}
+
+if [[ "/dev/$target_disk" == "/dev/$root_base" ]]; then
+    echo "Error: $TARGET_DEV is (or is on) the system/root disk." >&2
+    exit 1
+fi
+
+# Extra confirmation for non-removable devices
+if [[ $(lsblk -ndo RM "/dev/$target_disk" 2>/dev/null || echo 0) -eq 0 ]]; then
+    read -r -p "Target appears non-removable. Overwrite anyway? Type Y: " c
+    [[ $c =~ ^[Yy]$ ]] || exit 1
+fi
+
+# --- Decide decompressor ------------------------------------------------------
+declare -A dec_cmd=(
+  [gz]="gzip -dc"
+  [xz]="xz -dc"
+  [bz2]="bzip2 -dc"
+  [zst]="zstd -dc"
+  [img]="cat"
+)
+
+suffix=${IMAGE_FILE##*.}
+suffix=${suffix,,}
+
+# --- ZIP handling (fixed pipeline) --------------------------------------------
+if [[ $suffix == zip ]]; then
+    mapfile -t zip_names < <(unzip -Z -1 -- "$IMAGE_FILE")
+    [[ ${#zip_names[@]} -eq 1 ]] || { echo "Error: ZIP must contain exactly one file." >&2; exit 1; }
+    inner=${zip_names[0]}
+
+    # Size for pv (bytes)
+    # zipinfo -l prints a table; the first data row has the uncompressed size in column 1.
+    inner_size=$(zipinfo -l -- "$IMAGE_FILE" | awk 'NR>3 && $0!~/^---------/{print $1; exit}')
+
+    # Optional quick type hint
+    if ! unzip -p -- "$IMAGE_FILE" "$inner" >/dev/null 2>&1; then
+        echo "Error: Cannot read inner file from ZIP." >&2; exit 1
+    fi
+
+    echo "Flashing $(basename -- "$IMAGE_FILE") → $TARGET_DEV ..."
+    # Correct order: unzip → pv (with -s) → dd
+    if [[ -n ${inner_size:-} && $inner_size -gt 0 ]]; then
+        unzip -p -- "$IMAGE_FILE" "$inner" | pv -s "$inner_size" | dd of="$TARGET_DEV" bs=1M conv=fsync iflag=fullblock oflag=direct status=none
+    else
+        unzip -p -- "$IMAGE_FILE" "$inner" | pv | dd of="$TARGET_DEV" bs=1M conv=fsync iflag=fullblock oflag=direct status=none
+    fi
+    echo "Done."
+    exit 0
+fi
+
+# --- Non-ZIP handling ---------------------------------------------------------
+DECOMP_CMD=${dec_cmd[$suffix]:-cat}
+
+# Size for pv: only trust xz’s machine-readable totals; others are too often unreliable.
+SIZE_INFO=0
+case "$suffix" in
+  xz)
+    # Correct: xz --robot -l prints tab-separated fields; "totals" line 5 = uncompressed bytes.
+    SIZE_INFO=$(xz --robot -l -- "$IMAGE_FILE" | awk -F'\t' '$1=="totals"{print $5; exit}');;
+  img)
+    # Direct file size is reliable
+    SIZE_INFO=$(stat -c '%s' -- "$IMAGE_FILE");;
+  # gz/bz2/zst: sizes may be missing/wrong; let pv work without -s to avoid lying.
+  *) SIZE_INFO=0;;
+esac
+
+echo "Flashing $(basename -- "$IMAGE_FILE") → $TARGET_DEV ..."
+# Stream: decompressor reads file from stdin; pv should sit AFTER decompression so it reflects written bytes.
+if [[ ${SIZE_INFO:-0} -gt 0 ]]; then
+    eval "$DECOMP_CMD" <"$IMAGE_FILE" | pv -s "$SIZE_INFO" | dd of="$TARGET_DEV" bs=1M conv=fsync iflag=fullblock oflag=direct status=none
+else
+    eval "$DECOMP_CMD" <"$IMAGE_FILE" | pv | dd of="$TARGET_DEV" bs=1M conv=fsync iflag=fullblock oflag=direct status=none
+fi
+echo "Done."
