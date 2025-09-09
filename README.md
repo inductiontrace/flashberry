@@ -74,8 +74,3 @@ You are free to copy, modify, distribute, and use it for any purpose without res
 
 * This project has nothing to do with marijuana. I don’t support its use.
 * “flashberry” is just a name; think of SD cards, Raspberry Pis, and flashing images.
-
-```
-
-Want me to also generate a **`preview.png` with the badges and project logo together** so you can drop it in the repo root for GitHub’s social preview?
-```
